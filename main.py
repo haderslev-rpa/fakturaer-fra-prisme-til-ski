@@ -19,13 +19,14 @@ from q_haderslev_vbo.automation_server.ats_update_item_data import (
 from q_prisme365_api.api_client import initialiser_prisme
 
 from behandel import behandel_item
+from configuration import ANTAL_UGER_FORSINKELSE
+from configuration import ANTAL_UGER_TILBAGE
 from configuration import EFFECTIVE_FAKTURA_TEMP_ROOT
-from configuration import FAKTURADATO_FRA
-from configuration import FAKTURADATO_TIL
 from configuration import PRISME_CREDENTIAL_NAME
 from data_collection import build_queue_payloads
 from data_collection import collect_all_week_data
 from models import WeekInterval
+from period_helpers import resolve_invoice_period
 from week_helpers import allowed_references
 from week_helpers import cleanup_old_week_artifacts
 from week_helpers import iter_week_intervals
@@ -55,7 +56,6 @@ logging.getLogger(
     logging.WARNING
 )
 
-# API-klienten logger ellers hvert enkelt GET-kald på INFO.
 logging.getLogger(
     "q_prisme365_api.api_client"
 ).setLevel(
@@ -68,6 +68,68 @@ logger = logging.getLogger(
 
 
 # ------------------------------------------------------------
+# PERIODE
+# ------------------------------------------------------------
+
+def get_process_period() -> tuple:
+    """Beregn og log processens inklusive fakturaperiode.
+
+    Perioden styres kun af disse værdier i configuration.py:
+
+        ANTAL_UGER_FORSINKELSE
+        ANTAL_UGER_TILBAGE
+
+    Forsinkelsen beskytter mod fakturaer, som har en ældre
+    fakturadato, men først bliver bogført senere.
+
+    ANTAL_UGER_TILBAGE bestemmer, hvor mange komplette ISO-uger
+    processen kontrollerer. Eksisterende uge-referencer springes
+    fortsat over, før Prisme-kaldene starter.
+
+    Returns:
+        En tuple med to inklusive datoer:
+
+            (
+                fakturadato_fra,
+                fakturadato_til,
+            )
+    """
+    date_from, date_to = (
+        resolve_invoice_period()
+    )
+
+    start_iso = date_from.isocalendar()
+    end_iso = date_to.isocalendar()
+
+    logger.info(
+        "Automatisk fakturaperiode: %s til og med %s.",
+        date_from,
+        date_to,
+    )
+
+    logger.info(
+        "Periodeberegning: %s forsinkelsesuge(r), "
+        "%s komplette uge(r) i udtrækket.",
+        ANTAL_UGER_FORSINKELSE,
+        ANTAL_UGER_TILBAGE,
+    )
+
+    logger.info(
+        "Perioden dækker fra uge %s - %s "
+        "til og med uge %s - %s.",
+        start_iso.week,
+        start_iso.year,
+        end_iso.week,
+        end_iso.year,
+    )
+
+    return (
+        date_from,
+        date_to,
+    )
+
+
+# ------------------------------------------------------------
 # QUEUE-MODE
 # ------------------------------------------------------------
 
@@ -77,13 +139,17 @@ async def populate_queue(
 ) -> None:
     """Opret ét queue-item pr. manglende ISO-uge.
 
+    Ved hver --queue-kørsel beregnes perioden ud fra dags dato.
+    Der er derfor ingen start- eller slutdato, som skal ændres
+    manuelt i den løbende drift.
+
     Procesrækkefølgen er:
 
-    1. Find alle uge-referencer, der mangler i køen.
-    2. Hent tre datalister pr. manglende uge.
-    3. Match alle lister lokalt på tværs af uger.
-    4. Udfør præcise fallback-kald for manglende match.
-    5. Opret uge-items i ATS-køen.
+    1. Beregn den automatiske periode.
+    2. Kontrollér hvilke uge-referencer der allerede findes.
+    3. Hent API-data for de manglende uger.
+    4. Match data lokalt i Python.
+    5. Opret ét queue-item pr. manglende uge.
     """
     logger.info(
         "Populate queue mode startet "
@@ -96,8 +162,12 @@ async def populate_queue(
             "Workqueuen mangler id."
         )
 
+    date_from, date_to = get_process_period()
+
     missing_intervals = _find_missing_intervals(
-        workqueue
+        workqueue=workqueue,
+        date_from=date_from,
+        date_to=date_to,
     )
 
     if not missing_intervals:
@@ -186,6 +256,8 @@ async def populate_queue(
 
 def _find_missing_intervals(
     workqueue,
+    date_from,
+    date_to,
 ) -> list[WeekInterval]:
     """Find ugeintervaller, der ikke allerede findes i køen."""
     missing_intervals: list[WeekInterval] = []
@@ -195,8 +267,8 @@ def _find_missing_intervals(
         interval_to_exclusive,
         item_reference,
     ) in iter_week_intervals(
-        FAKTURADATO_FRA,
-        FAKTURADATO_TIL,
+        date_from,
+        date_to,
     ):
         item_exists = is_item_in_queue(
             queue_id=workqueue.id,
@@ -244,9 +316,11 @@ async def process_workqueue(
         debug,
     )
 
+    date_from, date_to = get_process_period()
+
     allowed = allowed_references(
-        FAKTURADATO_FRA,
-        FAKTURADATO_TIL,
+        date_from,
+        date_to,
     )
 
     deleted_paths = cleanup_old_week_artifacts(

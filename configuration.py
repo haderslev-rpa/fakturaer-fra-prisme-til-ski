@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from datetime import date
 import os
 from pathlib import Path
 
@@ -32,22 +31,46 @@ PRISME_TOP = 10000
 
 
 # ------------------------------------------------------------
-# FAKTURAPERIODE
+# AUTOMATISK FAKTURAPERIODE
 # ------------------------------------------------------------
 
-# Begge datoer er inklusive.
-FAKTURADATO_FRA = date(2025, 11, 1)
-FAKTURADATO_TIL = date(2026, 1, 31)
+# ANTAL_UGER_FORSINKELSE bestemmer, hvor langt processen går
+# tilbage fra den aktuelle ISO-uge, før en uge må behandles.
+#
+# Værdien 6 betyder, at den nyeste uge i udtrækket altid ligger
+# 6 hele ISO-uger før den uge, hvor --queue køres.
+#
+# Forsinkelsen giver fakturaer med en ældre fakturadato tid til
+# at blive bogført og komme med i VendTrans.
+ANTAL_UGER_FORSINKELSE = 6
+
+# ANTAL_UGER_TILBAGE bestemmer, hvor mange komplette ISO-uger
+# processen undersøger og forsøger at oprette queue-items for.
+#
+# Værdien 60 betyder præcis 60 komplette uger inklusive den
+# seneste tilladte uge efter forsinkelsen.
+#
+# Eksempel:
+# - Aktuel uge er uge 39.
+# - ANTAL_UGER_FORSINKELSE er 6.
+# - Seneste tilladte uge er uge 33.
+# - ANTAL_UGER_TILBAGE er 60.
+# - Processen undersøger uge 33 og de 59 foregående ISO-uger.
+ANTAL_UGER_TILBAGE = 65
 
 
 # ------------------------------------------------------------
 # LOKAL TEMPMAPPE
 # ------------------------------------------------------------
 
+# Standardplacering på Automation Server.
 FAKTURA_TEMP_ROOT = Path(
     "/tmp/fakturaer-fra-prisme-til-ski"
 )
 
+# Ved lokal debugging kan .env overskrive placeringen:
+#
+# FAKTURA_TEMP_ROOT=/home/dirujo/tests_local/fakturaer-fra-prisme-til-ski
 _env_temp_root = os.getenv(
     "FAKTURA_TEMP_ROOT",
     "",
@@ -72,16 +95,12 @@ SHAREPOINT_FOLDER_PATH = (
     "fakturaer-fra-prisme-til-ski"
 )
 
-# Simple Graph-upload bruges til og med 250 MiB.
-# Større filer bruger automatisk en upload session.
 SHAREPOINT_SIMPLE_UPLOAD_LIMIT_BYTES = (
     250
     * 1024
     * 1024
 )
 
-# Graph kræver, at upload-sessionens bidder er et multiplum
-# af 320 KiB. 10 MiB er præcis 32 * 320 KiB.
 SHAREPOINT_UPLOAD_CHUNK_SIZE_BYTES = (
     10
     * 1024
