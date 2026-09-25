@@ -1,284 +1,359 @@
+"""Automation Server-proces til ugeopdelte OIOUBL-fakturaer."""
+
+from __future__ import annotations
+
 import asyncio
+from datetime import timedelta
 import logging
+from pprint import pprint
 import sys
-import os
-from pprint import pprint  # helper (pæn print)
 
-# ------------------------------------------------------------
-# 🧠 PROCESS-KODE (ÉT ITEM)
-# ------------------------------------------------------------
-from behandel import behandel_page  # funktion (genbrugelig kodeblok)
-
-# ------------------------------------------------------------
-# 🧠 AUTOMATION SERVER
-# ------------------------------------------------------------
-from automation_server_client import (
-    AutomationServer,
-    Workqueue,
-    WorkItemError,
-    WorkItemStatus
-)
-
-from q_haderslev_vbo.automation_server.ats_update_item_data import (
-    update_item_data
-)
-
-
+from automation_server_client import AutomationServer
+from automation_server_client import WorkItemError
 from q_haderslev_vbo.automation_server.ats_is_item_in_queue import (
     is_item_in_queue,
 )
+from q_haderslev_vbo.automation_server.ats_update_item_data import (
+    update_item_data,
+)
+from q_prisme365_api.api_client import initialiser_prisme
 
-
-def _vaelg_items_til_behandling(workqueue: Workqueue):
-    """
-    Vælger items til behandling.
-
-    Output:
-    - Hvis DEBUG_ITEM_REFERENCE i .env mangler eller er tom:
-      Returneres selve workqueue til normal behandling.
-
-    - Hvis DEBUG_ITEM_REFERENCE har en værdi:
-      Returneres en liste med kun det første fundne NEW-item.
-      Itemet ændres til status "in progress".
-    """
-
-    item_reference = os.getenv(
-        "DEBUG_ITEM_REFERENCE",
-        "",
-    ).strip()
-
-    if not item_reference:
-        return workqueue
-
-    items = workqueue.get_item_by_reference(
-        reference=item_reference,
-        status=WorkItemStatus.NEW,
-    )
-
-    if not items:
-        raise RuntimeError(
-            f"Ingen NEW-items fundet med reference: {item_reference}"
-        )
-
-    item = items[0]
-
-    item.update_status(
-        WorkItemStatus.IN_PROGRESS.value,
-        "Startet via lokal debugkørsel",
-    )
-
-    return [item]
+from behandel import behandel_item
+from configuration import EFFECTIVE_FAKTURA_TEMP_ROOT
+from configuration import FAKTURADATO_FRA
+from configuration import FAKTURADATO_TIL
+from configuration import PRISME_CREDENTIAL_NAME
+from data_collection import build_queue_payloads
+from data_collection import collect_all_week_data
+from models import WeekInterval
+from week_helpers import allowed_references
+from week_helpers import cleanup_old_week_artifacts
+from week_helpers import iter_week_intervals
 
 
 # ------------------------------------------------------------
-# 🌐 PLAYWRIGHT (KAN SLETTES I PROCESSER UDEN BROWSER)
+# LOGGING
 # ------------------------------------------------------------
-from q_haderslev_vbo.playwright.browser_session import BrowserSession
 
-def get_headless_flag():  #Skriv HEADLESS=false i .env for at se browseren under kørsel
-    return os.getenv("HEADLESS", "true").lower() == "true"
-
-
-# ------------------------------------------------------------
-# LOGGING (STANDARD)
-# ------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    force=True,
+    format=(
+        "%(asctime)s [%(levelname)s] "
+        "%(name)s: %(message)s"
+    ),
 )
 
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("automation_server_client").setLevel(logging.WARNING)
-logging.getLogger("debugpy").setLevel(logging.WARNING)
+logging.getLogger(
+    "httpx"
+).setLevel(
+    logging.WARNING
+)
+
+logging.getLogger(
+    "automation_server_client"
+).setLevel(
+    logging.WARNING
+)
+
+# API-klienten logger ellers hvert enkelt GET-kald på INFO.
+logging.getLogger(
+    "q_prisme365_api.api_client"
+).setLevel(
+    logging.WARNING
+)
+
+logger = logging.getLogger(
+    __name__
+)
 
 
 # ------------------------------------------------------------
-# QUEUE-MODE (PRODUCER)
+# QUEUE-MODE
 # ------------------------------------------------------------
-async def populate_queue(workqueue: Workqueue, debug: bool):
-    logger = logging.getLogger(__name__)
-    logger.info("Populate queue mode started")
 
-    # ❗ Ingen Playwright her (standard Automation Server, men kan tilføjes)
-    raw_items = [
-        {"cpr": "1234567891", "type": "adresseopslag"},
-        {"cpr": "1111111111", "type": "fødselsdato"},
-        {"cpr": "2222222222", "type": "myndighed"},
-    ]
+async def populate_queue(
+    workqueue,
+    debug: bool,
+) -> None:
+    """Opret ét queue-item pr. manglende ISO-uge.
 
-    for raw_item in raw_items:
-        data_json = {}
+    Procesrækkefølgen er:
+
+    1. Find alle uge-referencer, der mangler i køen.
+    2. Hent tre datalister pr. manglende uge.
+    3. Match alle lister lokalt på tværs af uger.
+    4. Udfør præcise fallback-kald for manglende match.
+    5. Opret uge-items i ATS-køen.
+    """
+    logger.info(
+        "Populate queue mode startet "
+        "(debug=%s)",
+        debug,
+    )
+
+    if workqueue.id is None:
+        raise RuntimeError(
+            "Workqueuen mangler id."
+        )
+
+    missing_intervals = _find_missing_intervals(
+        workqueue
+    )
+
+    if not missing_intervals:
+        logger.info(
+            "Alle uge-referencer findes allerede i køen."
+        )
+        return
+
+    initialiser_prisme(
+        credential_name=(
+            PRISME_CREDENTIAL_NAME
+        )
+    )
+
+    logger.info(
+        "Henter først alle API-data for %s "
+        "manglende uge(r).",
+        len(
+            missing_intervals
+        ),
+    )
+
+    week_data = collect_all_week_data(
+        missing_intervals
+    )
+
+    logger.info(
+        "Alle ugeudtræk er hentet. "
+        "Starter lokal Python-matchning."
+    )
+
+    queue_payloads = build_queue_payloads(
+        week_data
+    )
+
+    for interval in missing_intervals:
+        files, statistics = queue_payloads[
+            interval.reference
+        ]
+
+        interval_to_inclusive = (
+            interval.date_to_exclusive
+            - timedelta(
+                days=1
+            )
+        )
+
+        iso_calendar = (
+            interval.date_from.isocalendar()
+        )
+
+        data_json: dict = {}
 
         update_item_data(
             data_json,
-            box_updates=raw_item,
-            update=False
+            box_updates={
+                "reference": interval.reference,
+                "uge": iso_calendar.week,
+                "aar": iso_calendar.year,
+                "periode_fra": (
+                    interval.date_from.isoformat()
+                ),
+                "periode_til": (
+                    interval_to_inclusive.isoformat()
+                ),
+                "fakturaer": files,
+                "statistik": statistics,
+            },
+            update=False,
+        )
+
+        workqueue.add_item(
+            data=data_json,
+            reference=interval.reference,
+        )
+
+        logger.info(
+            "Item med reference %r er tilføjet "
+            "med %s fil(er).",
+            interval.reference,
+            len(
+                files
+            ),
         )
 
 
-        item_reference = data_json["box"]["cpr"]
+def _find_missing_intervals(
+    workqueue,
+) -> list[WeekInterval]:
+    """Find ugeintervaller, der ikke allerede findes i køen."""
+    missing_intervals: list[WeekInterval] = []
 
-        # Kontrollér om item allerede venter eller behandles.
-        if is_item_in_queue(
-            queue_id= #INDSÆT ID på QUEUE - men skal gerne laves fra .env eller automation server ved ved ikke hvordan endnu.
+    for (
+        interval_from,
+        interval_to_exclusive,
+        item_reference,
+    ) in iter_week_intervals(
+        FAKTURADATO_FRA,
+        FAKTURADATO_TIL,
+    ):
+        item_exists = is_item_in_queue(
+            queue_id=workqueue.id,
             item_reference=item_reference,
             new=True,
             in_progress=True,
             completed=True,
-            new=True,
-            pending_user_action=True
-            start_datetime="2025-07-01T00:00:00Z",
-            end_datetime="2026-07-31T23:59:59.999999Z",
-            updated_at=False,
-        ):
-            print(
-                f"Springer over: Item med reference "
-                f"'{item_reference}' findes allerede i køen."
+            failed=True,
+            pending_user_action=True,
+        )
+
+        if item_exists:
+            logger.info(
+                "Springer over: Item med reference "
+                "%r findes allerede i køen.",
+                item_reference,
             )
             continue
 
-        workqueue.add_item(
-            data=data_json,
-            reference=item_reference,
+        missing_intervals.append(
+            WeekInterval(
+                date_from=interval_from,
+                date_to_exclusive=(
+                    interval_to_exclusive
+                ),
+                reference=item_reference,
+            )
         )
 
-        print(
-            f"Item med reference '{item_reference}' "
-            "er tilføjet til køen."
-        )
-
-
-
-
-    
+    return missing_intervals
 
 
 # ------------------------------------------------------------
-# PROCESS-MODE (WORKER)
+# PROCESS-MODE
 # ------------------------------------------------------------
-async def process_workqueue(workqueue: Workqueue, debug: bool):
-    logger = logging.getLogger(__name__)
-    logger.info(f"Process workqueue mode started (debug={debug})")
 
-    # =========================================================
-    # 🌐 PLAYWRIGHT – ÉN BROWSERSESSION FOR HELE PROCESSEN
-    #
-    # ✅ KAN SLETTES i processer uden browser
-    # =========================================================
-    headless = get_headless_flag()
-    session = BrowserSession(headless=headless,debug=debug)
-    await session.start()
-    page = await session.new_page()  # Page (browser-fane)
+async def process_workqueue(
+    workqueue,
+    debug: bool,
+) -> None:
+    """Behandl køens uge-items uden Playwright."""
+    logger.info(
+        "Process workqueue mode startet "
+        "(debug=%s)",
+        debug,
+    )
 
-    try: # denne try bruges kun til PLAYWRIGHT processer
-        # Workqueue er iterable → hvert item behandles ét ad gangen
-        for item in _vaelg_items_til_behandling(workqueue): #DEBUG_ITEM_REFERENCE=xxx i .env hvis man vil hente bestemte item.
+    allowed = allowed_references(
+        FAKTURADATO_FRA,
+        FAKTURADATO_TIL,
+    )
 
-            with item:
-                data = item.data
+    deleted_paths = cleanup_old_week_artifacts(
+        EFFECTIVE_FAKTURA_TEMP_ROOT,
+        allowed,
+    )
 
-                try:
-                    print("==================================== NEXT ITEM ====================================")
-                    print(f"ITEM = ID: {item.id} - Reference: {item.reference}")
+    for deleted_path in deleted_paths:
+        logger.info(
+            "Slettede gammel procesfil "
+            "eller mappe: %s",
+            deleted_path,
+        )
 
-                    # --------------------------------------------------
-                    # ▶ PROCESS-KODE
-                    # (behandel_page bruger Playwright internt)
-                    # --------------------------------------------------
-                    await behandel_page(item=item, session=session, page=page) #Fjern session og page hvis du ikke bruger Playwright i din process
+    for item in workqueue:
+        with item:
+            data = item.data
 
-                    update_item_data(
-                        data,
-                        item=item,
-                        status="Completed",
-                        status_code="Færdig",
-                        state="Completed",
+            try:
+                print(
+                    "=" * 36
+                    + " NEXT ITEM "
+                    + "=" * 36
+                )
 
+                pprint(
+                    data
+                )
+
+                behandel_item(
+                    item
+                )
+
+                update_item_data(
+                    data,
+                    item=item,
+                    status="Completed",
+                    status_code="Færdig",
+                    state="Completed",
+                )
+
+                item.update(
+                    data
+                )
+
+                item.complete(
+                    "Completed"
+                )
+
+            except WorkItemError as error:
+                logger.error(
+                    "WorkItemError for item %s: %s",
+                    item.reference,
+                    error,
+                )
+
+                item.fail(
+                    str(
+                        error
                     )
+                )
 
-                    item.update(data)
-                    item.complete("Completed")
-
-                except WorkItemError as e:
-                    # =================================================
-                    # ✅ SOFT ERROR
-                    # - Item fejler
-                    # =================================================
-                    logger.error(f"WorkItemError for item {item.reference}: {e}")
-                    item.fail(str(e))
-                    
-                    # Playwright:
-                    # Luk browser for sikkerhed (ny session på næste item)
-                    headless = get_headless_flag()
-                    session = BrowserSession(headless=headless,debug=debug)
-                    await session.start()
-
-                except Exception as e:
-                    # =================================================
-                    # ❌ HARD ERROR
-                    # - Screenshot tages
-                    # - Browser lukkes
-                    # - Processen STOPPER
-                    # =================================================
-                    logger.exception("Uventet fejl")
-
-                    try: #Playwright:
-                        if session.context and session.context.pages:
-                            page = session.context.pages[-1]
-                            await session.screenshot(
-                                page,
-                                f"hard_exception_{type(e).__name__}",
-                                always=True
-                            )
-                    except Exception:
-                        logger.warning("Kunne ikke tage screenshot ved hard error")
-
-                    # Luk ALT (Playwright)
-                    await session.close()
-
-                    # Stop hele processen (Automation Server genstarter)
-                    raise
-
-    finally: # PLAYWRIGHT:
-        # =====================================================
-        # 🧹 SIKKER OPRYDNING
-        #
-        # ✅ Lukker browser hvis processen afsluttes normalt
-        # =====================================================
-        await session.close() # denne try bruges kun til PLAYWRIGHT processer og kan slettes
+            except Exception:
+                logger.exception(
+                    "Uventet fejl for item %s",
+                    item.reference,
+                )
+                raise
 
 
 # ------------------------------------------------------------
 # MAIN ENTRY POINT
 # ------------------------------------------------------------
+
 if __name__ == "__main__":
+    DEBUG = (
+        "--debug"
+        in sys.argv
+    )
 
-    # ✅ CLI flags (runtime-parametre)
-    DEBUG = "--debug" in sys.argv   # bool (sand/falsk)
-    QUEUE_MODE = "--queue" in sys.argv
+    QUEUE_MODE = (
+        "--queue"
+        in sys.argv
+    )
 
-    ats = AutomationServer.from_environment()
-    workqueue = ats.workqueue()
+    automation_server = (
+        AutomationServer.from_environment()
+    )
 
-    # --------------------------------------------------------
-    # QUEUE-MODE
-    # --------------------------------------------------------
+    workqueue = (
+        automation_server.workqueue()
+    )
+
     if QUEUE_MODE:
-        # ---------------------------------------------------------------
-        # VIGTIGT:
-        # Denne linje CLEARSER alle NEW items i køen.
-        #
-        # ❗ Hvis du ALDRIG vil slette eksisterende NEW items:
-        #     → så SKAL denne linje fjernes eller kommenteres ud.
-        #
-        # workqueue.clear_workqueue(WorkItemStatus.NEW)
-        
-        workqueue.clear_workqueue(WorkItemStatus.NEW)
-        asyncio.run(populate_queue(workqueue, debug=DEBUG))
-        sys.exit(0)
+        asyncio.run(
+            populate_queue(
+                workqueue,
+                debug=DEBUG,
+            )
+        )
+        sys.exit(
+            0
+        )
 
-    # --------------------------------------------------------
-    # PROCESS-MODE
-    # --------------------------------------------------------
-    asyncio.run(process_workqueue(workqueue, debug=DEBUG))
+    asyncio.run(
+        process_workqueue(
+            workqueue,
+            debug=DEBUG,
+        )
+    )
