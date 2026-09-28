@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 from datetime import timedelta
 import logging
-from pprint import pprint
 import sys
 
 from automation_server_client import AutomationServer
@@ -83,8 +82,10 @@ def get_process_period() -> tuple:
     fakturadato, men først bliver bogført senere.
 
     ANTAL_UGER_TILBAGE bestemmer, hvor mange komplette ISO-uger
-    processen kontrollerer. Eksisterende uge-referencer springes
-    fortsat over, før Prisme-kaldene starter.
+    processen kontrollerer.
+
+    Eksisterende uge-referencer springes fortsat over, før
+    Prisme-kaldene starter.
 
     Returns:
         En tuple med to inklusive datoer:
@@ -102,13 +103,15 @@ def get_process_period() -> tuple:
     end_iso = date_to.isocalendar()
 
     logger.info(
-        "Automatisk fakturaperiode: %s til og med %s.",
+        "Automatisk fakturaperiode: "
+        "%s til og med %s.",
         date_from,
         date_to,
     )
 
     logger.info(
-        "Periodeberegning: %s forsinkelsesuge(r), "
+        "Periodeberegning: "
+        "%s forsinkelsesuge(r), "
         "%s komplette uge(r) i udtrækket.",
         ANTAL_UGER_FORSINKELSE,
         ANTAL_UGER_TILBAGE,
@@ -258,8 +261,15 @@ def _find_missing_intervals(
     workqueue,
     date_from,
     date_to,
-) -> list[WeekInterval]:
-    """Find ugeintervaller, der ikke allerede findes i køen."""
+) -> list:
+    """Find ugeintervaller, der ikke allerede findes i køen.
+
+    Returns:
+        En liste med WeekInterval-objekter.
+
+        Listen indeholder kun uger, som ikke allerede findes
+        i Automation Server-køen.
+    """
     missing_intervals: list[WeekInterval] = []
 
     for (
@@ -309,7 +319,20 @@ async def process_workqueue(
     workqueue,
     debug: bool,
 ) -> None:
-    """Behandl køens uge-items uden Playwright."""
+    """Behandl køens uge-items uden Playwright.
+
+    For hvert item vises kun:
+
+        reference
+        kreditorfakturaer
+        filer
+        ignorerede
+        kilde-fallback
+        dokument-fallback
+        fakturaer med flere OIOUBL
+
+    Hele itemets JSON-data udskrives ikke.
+    """
     logger.info(
         "Process workqueue mode startet "
         "(debug=%s)",
@@ -340,14 +363,52 @@ async def process_workqueue(
             data = item.data
 
             try:
-                print(
-                    "=" * 36
-                    + " NEXT ITEM "
-                    + "=" * 36
+                box = data.get(
+                    "box"
                 )
 
-                pprint(
-                    data
+                if not isinstance(
+                    box,
+                    dict,
+                ):
+                    raise WorkItemError(
+                        "Itemet mangler gyldige box-data."
+                    )
+
+                reference = str(
+                    box.get(
+                        "reference",
+                        "",
+                    )
+                    or ""
+                ).strip()
+
+                if not reference:
+                    raise WorkItemError(
+                        "Itemet mangler box.reference."
+                    )
+
+                statistics = box.get(
+                    "statistik",
+                    {},
+                )
+
+                if not isinstance(
+                    statistics,
+                    dict,
+                ):
+                    statistics = {}
+
+                print()
+                print("=" * 78)
+                print(
+                    f"NEXT ITEM: {reference}"
+                )
+                print("=" * 78)
+                print()
+
+                _print_item_statistics(
+                    statistics
                 )
 
                 behandel_item(
@@ -391,6 +452,67 @@ async def process_workqueue(
                 raise
 
 
+def _print_item_statistics(
+    statistics: dict,
+) -> None:
+    """Udskriv den vigtigste statistik for et uge-item.
+
+    Output:
+        Funktionen udskriver statistik til terminalen.
+
+        Funktionen returnerer ingen værdi.
+    """
+    print(
+        "Kreditorfakturaer:",
+        statistics.get(
+            "kreditorfakturaer",
+            0,
+        ),
+    )
+
+    print(
+        "Filer:",
+        statistics.get(
+            "filer",
+            0,
+        ),
+    )
+
+    print(
+        "Ignorerede:",
+        statistics.get(
+            "ignorerede",
+            0,
+        ),
+    )
+
+    print(
+        "Kilde-fallback:",
+        statistics.get(
+            "kilde_fallback",
+            0,
+        ),
+    )
+
+    print(
+        "Dokument-fallback:",
+        statistics.get(
+            "dokument_fallback",
+            0,
+        ),
+    )
+
+    print(
+        "Fakturaer med flere OIOUBL:",
+        statistics.get(
+            "fakturaer_med_flere_oioubl",
+            0,
+        ),
+    )
+
+    print()
+
+
 # ------------------------------------------------------------
 # MAIN ENTRY POINT
 # ------------------------------------------------------------
@@ -421,6 +543,7 @@ if __name__ == "__main__":
                 debug=DEBUG,
             )
         )
+
         sys.exit(
             0
         )
