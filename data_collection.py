@@ -554,10 +554,44 @@ def _fetch_creditor_invoices(
     date_from: date,
     date_to_exclusive: date,
 ) -> list[dict[str, Any]]:
-    """Hent VendTrans for ét halvåbent interval."""
+    """Hent VendTrans via bogføringsdato for ét ugeinterval.
+
+    Ugeintervallet anvendes på:
+
+        VendTrans.TransDate
+
+    Dermed bliver fakturaen placeret i queue-itemet for den uge,
+    hvor kreditorposteringen blev bogført.
+
+    DocumentDate beholdes i de returnerede rækker som
+    fakturadato og bruges senere til matchningen med
+    VendInvoiceInfo.
+
+    Args:
+        date_from:
+            Første bogføringsdato i ugen, inklusive.
+
+        date_to_exclusive:
+            Første dato efter ugeintervallet, eksklusive.
+
+    Returns:
+        En liste med normaliserede kreditorfakturaer.
+
+        Hver række indeholder blandt andet:
+
+            Fakturanummer
+            Kreditorkonto
+            Fakturadato
+            Bogføringsdato
+            Voucher
+            Beløb
+            RecIdLoc
+    """
     return hent_kreditorfakturaer(
-        date_from,
-        date_to_exclusive,
+        bogfoeringsdato_fra=date_from,
+        bogfoeringsdato_til=(
+            date_to_exclusive
+        ),
         voucher_prefix=VOUCHER_PREFIX,
         data_area_id=DATA_AREA_ID,
         top=PRISME_TOP,

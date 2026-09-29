@@ -605,7 +605,7 @@ dependencies = [
 [[package]]
 name = "q-prisme365-api"
 version = "0.2.0"
-source = { git = "https://github.com/haderslev-rpa/q-prisme365-api.git?branch=main#4b4d03b8748729d9778b50d4fa1e4cd2f6174f0b" }
+source = { git = "https://github.com/haderslev-rpa/q-prisme365-api.git?branch=main#2e5df9aa8a8d487a4e9b41ee6063cc4b304eda72" }
 dependencies = [
     { name = "automation-server-client" },
     { name = "q-haderslev-vbo" },
